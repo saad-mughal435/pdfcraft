@@ -1715,8 +1715,9 @@ impl Automation {
     /// One PDF per file, written into `out_dir`; a file that fails doesn't stop the others.
     fn create_separate(&mut self, a: &Args, paths: &[&str]) -> Result<Value> {
         let dir = self.resolve(a.str("out_dir").map_err(|_| ToolError::InvalidArgs("mode \"separate\" needs out_dir".into()))?, true)?;
-        std::fs::create_dir_all(&dir).map_err(|e| failed(format!("{}: {e}", dir.display())))?;
+        // Checked before the folder is made, so a bad page_size leaves nothing behind.
         let page = Self::image_page(a)?;
+        std::fs::create_dir_all(&dir).map_err(|e| failed(format!("{}: {e}", dir.display())))?;
         let mut out = Vec::new();
         for &p in paths {
             let converted = self.resolve(p, false).map_err(|e| e.to_string()).and_then(|src| {

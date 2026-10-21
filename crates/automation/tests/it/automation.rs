@@ -7928,6 +7928,9 @@ fn text_box_and_callout_fill_and_border_through_tools() {
     let saved = session.open("transparent.pdf", None, bytes, None).unwrap();
     for index in 0..2 {
         assert_eq!(session.get(saved).unwrap().comment_props(0, index).unwrap().fill, None);
+    }
+}
+
 /// #3273: images became pages as large as their pixels, so a set of photos gave pages of several
 /// sizes and none of them paper. `page_size` puts them all on one sheet, scaled to fit.
 #[test]
@@ -7979,13 +7982,19 @@ fn image_pages_go_on_a_chosen_paper_size_through_every_create_tool() {
     let one = ok(&mut a, "doc_open", json!({ "path": "out/a_page_1.pdf" }))["doc"].as_u64().unwrap();
     assert!(close(size(&mut a, one, 0), A4));
 
-    // A size that is not a paper name or a pair of points is refused, on every tool.
+    // A size that is not a paper name or a pair of points is refused, by every tool that takes
+    // one and in both of doc_create_multiple's modes, before anything is written.
     for bad in [json!("A9"), json!([300]), json!(["a", "b"]), json!(5), json!({})] {
-        assert!(
-            matches!(a.call("doc_create", &json!({ "from": "images", "paths": shots, "page_size": bad })), Err(ToolError::InvalidArgs(_))),
-            "{bad} should be refused"
-        );
+        for (tool, args) in [
+            ("doc_create", json!({ "from": "images", "paths": shots, "page_size": bad.clone() })),
+            ("doc_create_multiple", json!({ "paths": shots, "page_size": bad.clone(), "out": "refused.pdf" })),
+            ("doc_create_multiple", json!({ "paths": shots, "mode": "separate", "out_dir": "refused", "page_size": bad.clone() })),
+        ] {
+            assert!(matches!(a.call(tool, &args), Err(ToolError::InvalidArgs(_))), "{tool}: {bad} should be refused");
+        }
     }
+    assert!(!dir.join("refused.pdf").exists(), "a refused page_size leaves no file behind");
+    assert!(!dir.join("refused").exists(), "nor a folder");
 }
 
 /// Three paragraphs: Alpha (two rows), Bravo (one row) and Charlie (two rows), at the leading
