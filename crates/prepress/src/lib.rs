@@ -26,6 +26,13 @@ pub const SAVED_MEDIA_KEY: &[u8] = b"PCMarksMediaBox";
 /// (§7.7.3.4). Removal then takes the entry away again rather than leaving a direct box behind
 /// where the file had none.
 pub const SAVED_MEDIA_INHERITED_KEY: &[u8] = b"PCMarksMediaInherited";
+/// A page whose crop box [`add_printer_marks`] enlarged keeps the original here. The crop box is
+/// what a viewer shows and a RIP cuts to, so a mark outside it is invisible however big the media
+/// box is; growing the page has to grow both.
+pub const SAVED_CROP_KEY: &[u8] = b"PCMarksCropBox";
+/// [`SAVED_MEDIA_INHERITED_KEY`] for the crop box: set when the page inherited one (§7.7.3.4)
+/// rather than carrying its own.
+pub const SAVED_CROP_INHERITED_KEY: &[u8] = b"PCMarksCropInherited";
 /// The annotation flags every mark gets: Print (bit 3) and ReadOnly (bit 7), so marks go to the
 /// press and cannot be dragged off the page by accident.
 pub const MARK_FLAGS: i64 = 4 | 64;
@@ -185,9 +192,10 @@ impl Marks {
 pub struct Report {
     /// Mark annotations added.
     pub added: usize,
-    /// Pages whose marks reach outside the media box, which was left as it is.
+    /// Pages whose marks reach outside the media box or the crop box, neither of which was
+    /// changed. The crop box counts because it is what a viewer shows and a RIP cuts to.
     pub clipped: Vec<usize>,
-    /// Pages whose media box was enlarged to fit the marks.
+    /// Pages whose media box, and crop box where the page had one, were enlarged to fit the marks.
     pub grown: Vec<usize>,
     /// Pages where bleed marks were skipped because the bleed box matches the reference box, so
     /// they would have been drawn exactly under the crop marks.
@@ -356,11 +364,19 @@ fn annots(doc: &Document, page: ObjRef) -> Vec<Object> {
     doc.resolve(a).as_array().cloned().unwrap_or_default()
 }
 
-/// Replace a page's `/Annots`, writing into the shared array object when it is indirect.
+/// Replace a page's `/Annots`.
+///
+/// An indirect array this page alone points at is written in place, so the object graph survives
+/// the edit. One that another page points at too is left alone and this page is given its own
+/// direct array: some producers share one array across every page, and writing into it would put
+/// page one's marks on every other page.
 fn set_annots(doc: &mut Document, page: ObjRef, list: Vec<Object>) -> Result<()> {
     let existing = doc.get(page).as_dict().and_then(|d| d.reference(b"Annots"));
+    let shared = existing.is_some_and(|r| {
+        pdfcraft_model::pages(doc).iter().any(|p| p.obj != page && doc.get(p.obj).as_dict().and_then(|d| d.reference(b"Annots")) == Some(r))
+    });
     match existing {
-        Some(r) if doc.get(r).as_array().is_some() => doc.set(r, Object::Array(list)),
+        Some(r) if !shared && doc.get(r).as_array().is_some() => doc.set(r, Object::Array(list)),
         _ => doc.update_dict(page, |d| {
             if list.is_empty() {
                 d.remove(b"Annots");
@@ -408,9 +424,14 @@ pub fn add_printer_marks(doc: &mut Document, pages_wanted: &[usize], m: &Marks) 
             continue;
         }
         let mut list = annots(doc, page.obj);
-        let mut needed = b.media;
+        // Measured against both reference boxes. The media box bounds the sheet, but the crop box
+        // is what a viewer shows and a RIP cuts to, so a mark inside a large media box and outside
+        // a smaller crop box is invisible. `needed` cannot be compared with `b.crop` directly,
+        // since it starts from the media box and the crop box is clipped inside it.
+        let (mut needed, mut needed_crop) = (b.media, b.crop);
         for mark in &marks {
             needed = union(needed, mark.rect);
+            needed_crop = union(needed_crop, mark.rect);
             let ap = doc.add(Object::Stream(appearance(mark)));
             let mut d = Dict::new();
             d.set(b"Type".to_vec(), Object::name("Annot"));
@@ -426,20 +447,40 @@ pub fn add_printer_marks(doc: &mut Document, pages_wanted: &[usize], m: &Marks) 
             report.added = report.added.saturating_add(1);
         }
         set_annots(doc, page.obj, list)?;
-        if needed != b.media {
+        // A page with no crop box of its own anywhere in the chain has `crop == media`, so growing
+        // the media box carries it along and there is nothing else to do.
+        let has_crop = page.dict.contains(b"CropBox");
+        let (grow_media_box, grow_crop_box) = (needed != b.media, has_crop && needed_crop != b.crop);
+        if grow_media_box || grow_crop_box {
             if m.grow_media {
-                let original = b.media;
-                // The grown box goes on the page itself, so a shared `/Pages` node keeps the
-                // size every other page inherits from it.
-                let inherited = !doc.get(page.obj).as_dict().is_some_and(|d| d.contains(b"MediaBox"));
+                // The grown boxes go on the page itself, so a shared `/Pages` node keeps the size
+                // every other page inherits from it. Each box is saved only if it is being
+                // changed, so removal puts back exactly what was touched and nothing else.
+                let page_dict = doc.get(page.obj).as_dict().cloned().unwrap_or_default();
+                let media_inherited = !page_dict.contains(b"MediaBox");
+                let crop_inherited = !page_dict.contains(b"CropBox");
+                let (original, original_crop) = (b.media, b.crop);
                 doc.update_dict(page.obj, |d| {
-                    if !d.contains(SAVED_MEDIA_KEY) {
-                        d.set(SAVED_MEDIA_KEY.to_vec(), num_array(&original));
-                        if inherited {
-                            d.set(SAVED_MEDIA_INHERITED_KEY.to_vec(), Object::Bool(true));
+                    if grow_media_box {
+                        if !d.contains(SAVED_MEDIA_KEY) {
+                            d.set(SAVED_MEDIA_KEY.to_vec(), num_array(&original));
+                            if media_inherited {
+                                d.set(SAVED_MEDIA_INHERITED_KEY.to_vec(), Object::Bool(true));
+                            }
                         }
+                        d.set(b"MediaBox".to_vec(), num_array(&needed));
                     }
-                    d.set(b"MediaBox".to_vec(), num_array(&needed));
+                    if grow_crop_box {
+                        if !d.contains(SAVED_CROP_KEY) {
+                            d.set(SAVED_CROP_KEY.to_vec(), num_array(&original_crop));
+                            if crop_inherited {
+                                d.set(SAVED_CROP_INHERITED_KEY.to_vec(), Object::Bool(true));
+                            }
+                        }
+                        // Only as far as the marks reach: the crop the user chose for the artwork
+                        // is kept otherwise.
+                        d.set(b"CropBox".to_vec(), num_array(&needed_crop));
+                    }
                 })?;
                 report.grown.push(index.saturating_add(1));
             } else {
@@ -475,18 +516,27 @@ pub fn remove_printer_marks(doc: &mut Document, pages_wanted: &[usize]) -> Resul
         removed = removed.saturating_add(before.len().saturating_sub(kept.len()));
         set_annots(doc, page.obj, kept)?;
         let dict = doc.get(page.obj).as_dict().cloned().unwrap_or_default();
-        if let Some(original) = rect(doc, dict.get(SAVED_MEDIA_KEY)) {
-            let inherited = matches!(dict.get(SAVED_MEDIA_INHERITED_KEY).map(|o| doc.resolve(o)).as_deref(), Some(Object::Bool(true)));
+        let was_inherited = |key: &[u8]| matches!(dict.get(key).map(|o| doc.resolve(o)).as_deref(), Some(Object::Bool(true)));
+        let (saved_media, saved_crop) = (rect(doc, dict.get(SAVED_MEDIA_KEY)), rect(doc, dict.get(SAVED_CROP_KEY)));
+        if saved_media.is_some() || saved_crop.is_some() {
+            // A page that inherited a box has the entry taken away rather than written back: the
+            // file had none of its own and must not gain one here (§7.7.3.4).
+            let media_inherited = was_inherited(SAVED_MEDIA_INHERITED_KEY);
+            let crop_inherited = was_inherited(SAVED_CROP_INHERITED_KEY);
             doc.update_dict(page.obj, |d| {
-                // A page that inherited its size has the entry taken away rather than written
-                // back: the file had no media box of its own and must not gain one here.
-                if inherited {
-                    d.remove(b"MediaBox");
-                } else {
-                    d.set(b"MediaBox".to_vec(), num_array(&original));
+                for (key, saved, inherited, saved_key, inherited_key) in [
+                    (&b"MediaBox"[..], saved_media, media_inherited, SAVED_MEDIA_KEY, SAVED_MEDIA_INHERITED_KEY),
+                    (&b"CropBox"[..], saved_crop, crop_inherited, SAVED_CROP_KEY, SAVED_CROP_INHERITED_KEY),
+                ] {
+                    let Some(original) = saved else { continue };
+                    if inherited {
+                        d.remove(key);
+                    } else {
+                        d.set(key.to_vec(), num_array(&original));
+                    }
+                    d.remove(saved_key);
+                    d.remove(inherited_key);
                 }
-                d.remove(SAVED_MEDIA_KEY);
-                d.remove(SAVED_MEDIA_INHERITED_KEY);
             })?;
         }
     }

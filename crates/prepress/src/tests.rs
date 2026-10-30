@@ -393,24 +393,48 @@ fn removal_keeps_printer_marks_another_producer_wrote() {
     assert_eq!(remove_printer_marks(&mut d, &[0, 1]).unwrap(), 0);
 }
 
+/// An indirect `/Annots` one page owns is written in place, so the object graph survives. One that
+/// two pages share is not: the second page must not pick up the first page's marks. The earlier
+/// version of this test was named for the shared case and did not build it, since the second page
+/// had no `/Annots` at all.
 #[test]
-fn marks_are_appended_to_a_shared_annots_array_in_place() {
-    // Both pages point at the same indirect /Annots array, as files written by some producers do.
-    let bytes = Pdf::new()
-        .obj("<< /Type /Catalog /Pages 2 0 R >>")
-        .obj("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>")
-        .obj("<< /Type /Page /Parent 2 0 R /Annots 5 0 R /TrimBox [100 100 512 692] >>")
-        .obj("<< /Type /Page /Parent 2 0 R >>")
-        .obj("[]")
-        .build();
-    let mut d = Document::open(Arc::new(bytes)).expect("opens");
+fn marks_go_into_a_shared_annots_array_without_reaching_the_other_page() {
+    // Both pages really do point at the same indirect array, as files from some producers do.
+    let shared = || {
+        Pdf::new()
+            .obj("<< /Type /Catalog /Pages 2 0 R >>")
+            .obj("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>")
+            .obj("<< /Type /Page /Parent 2 0 R /Annots 5 0 R /TrimBox [100 100 512 692] >>")
+            .obj("<< /Type /Page /Parent 2 0 R /Annots 5 0 R /TrimBox [100 100 512 692] >>")
+            .obj("[]")
+            .build()
+    };
+    let mut d = Document::open(Arc::new(shared())).expect("opens");
     add_printer_marks(&mut d, &[0], &Marks { crop: true, ..Marks::default() }).unwrap();
-    // The array object itself was updated, so the page still references it.
-    let page = doc_dict(&d, 0);
-    assert_eq!(page.reference(b"Annots"), Some(ObjRef::new(5, 0)));
+    assert_eq!(annot_dicts(&d, 0).len(), 4, "page 1 has its marks");
+    assert!(annot_dicts(&d, 1).is_empty(), "page 2 shares the array and must not have gained them");
+    assert_eq!(doc_dict(&d, 1).reference(b"Annots"), Some(ObjRef::new(5, 0)), "page 2 still points at the shared array");
+    assert!(doc_dict(&d, 0).reference(b"Annots").is_none(), "page 1 took its own array instead of overwriting the shared one");
+    assert_eq!(remove_printer_marks(&mut d, &[0]).unwrap(), 4);
+    assert!(annot_dicts(&d, 0).is_empty() && annot_dicts(&d, 1).is_empty());
+
+    // An array only one page points at is still edited in place, which is the case the old test
+    // was really covering.
+    let mut d = Document::open(Arc::new(
+        Pdf::new()
+            .obj("<< /Type /Catalog /Pages 2 0 R >>")
+            .obj("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>")
+            .obj("<< /Type /Page /Parent 2 0 R /Annots 5 0 R /TrimBox [100 100 512 692] >>")
+            .obj("<< /Type /Page /Parent 2 0 R >>")
+            .obj("[]")
+            .build(),
+    ))
+    .expect("opens");
+    add_printer_marks(&mut d, &[0], &Marks { crop: true, ..Marks::default() }).unwrap();
+    assert_eq!(doc_dict(&d, 0).reference(b"Annots"), Some(ObjRef::new(5, 0)), "the array object itself was updated");
     assert_eq!(annot_dicts(&d, 0).len(), 4);
     assert_eq!(remove_printer_marks(&mut d, &[0]).unwrap(), 4);
-    assert_eq!(doc_dict(&d, 0).reference(b"Annots"), Some(ObjRef::new(5, 0)), "the shared array is kept");
+    assert_eq!(doc_dict(&d, 0).reference(b"Annots"), Some(ObjRef::new(5, 0)), "the unshared array is kept");
     assert!(annot_dicts(&d, 0).is_empty());
 }
 
@@ -544,4 +568,56 @@ fn the_number_formatter_writes_short_stable_pdf_syntax() {
     assert_eq!(draw::n(0.25), "0.25");
     assert_eq!(draw::n(-6.125), "-6.125");
     assert_eq!(draw::n(1.0 / 3.0), "0.333");
+}
+
+fn crop_of(doc: &Document, page: usize) -> Option<Rect> {
+    let d = doc.get(page_obj(doc, page)).as_dict().cloned().unwrap_or_default();
+    rect(doc, d.get(b"CropBox"))
+}
+
+/// The crop box is what a viewer shows and a RIP cuts to, so a mark inside a large media box and
+/// outside a smaller crop box is invisible. Growing the page has to grow both, and removal has to
+/// put both back. Before this, marks were measured against the media box alone: a page with an
+/// explicit crop box reported neither clipped nor grown and the marks were simply not shown.
+#[test]
+fn an_explicit_crop_box_is_grown_with_the_media_box_and_put_back() {
+    // Letter crop inside a larger sheet, so every mark lands outside the crop box.
+    // The sheet fits every mark; the crop box does not. So the old code, which looked only at the
+    // media box, reported neither clipped nor grown and the marks were simply never shown.
+    let page = "/MediaBox [0 0 1200 1400] /CropBox [100 100 712 892] /TrimBox [120 120 692 872]";
+
+    // Without grow_media the page is reported clipped, which it is: the marks will not be seen.
+    let mut d = doc(page, "");
+    let report = add_printer_marks(&mut d, &[0], &all_marks()).unwrap();
+    assert_eq!(report.clipped, vec![1], "marks outside the crop box are clipped even though the media box fits them");
+    assert_eq!(crop_of(&d, 0), Some([100.0, 100.0, 712.0, 892.0]), "and nothing was changed");
+
+    // With it, both boxes grow and every mark is inside the crop box, not merely inside the sheet.
+    let mut d = doc(page, "");
+    let report = add_printer_marks(&mut d, &[0], &Marks { grow_media: true, ..all_marks() }).unwrap();
+    assert_eq!((report.grown.as_slice(), report.clipped.as_slice()), ([1].as_slice(), [].as_slice()));
+    let crop = crop_of(&d, 0).expect("the page still has a crop box");
+    assert!(crop != [100.0, 100.0, 712.0, 892.0], "the crop box was enlarged");
+    for r in annot_dicts(&d, 0).iter().map(rect_of) {
+        assert!(
+            r[0] >= crop[0] - 1e-9 && r[1] >= crop[1] - 1e-9 && r[2] <= crop[2] + 1e-9 && r[3] <= crop[3] + 1e-9,
+            "{r:?} is outside the grown crop box {crop:?}"
+        );
+    }
+    // Only as far as the marks reach: the crop stays inside the grown sheet.
+    let media = media_of(&d, 0);
+    assert!(crop[2] <= media[2] + 1e-9 && crop[3] <= media[3] + 1e-9, "crop {crop:?} outgrew media {media:?}");
+
+    assert_eq!(remove_printer_marks(&mut d, &[0]).unwrap(), report.added);
+    assert_eq!(crop_of(&d, 0), Some([100.0, 100.0, 712.0, 892.0]), "removal puts the crop box back");
+    assert_eq!(media_of(&d, 0), [0.0, 0.0, 1200.0, 1400.0], "and the media box, which never needed growing");
+    assert!(!doc_has_key(&d, 0, SAVED_CROP_KEY), "the saved crop box is cleared");
+    assert!(!doc_has_key(&d, 0, SAVED_MEDIA_KEY), "and no media box was saved, since none was changed");
+
+    // A page with no crop box anywhere keeps having none: crop follows media, so there is nothing
+    // to grow or to save.
+    let mut d = fixture();
+    add_printer_marks(&mut d, &[0], &Marks { grow_media: true, ..all_marks() }).unwrap();
+    assert_eq!(crop_of(&d, 0), None, "no crop box was invented");
+    assert!(!doc_has_key(&d, 0, SAVED_CROP_KEY));
 }
