@@ -26,9 +26,9 @@ pub(crate) const PREVIEW_BOX: (f32, f32) = (PREVIEW_W - 2.0 * PREVIEW_INSET, PRE
 /// the UI thread); further pages print whole.
 pub(crate) const LABEL_CROP_PAGES: usize = 50;
 
-/// Lists the printers off the UI thread (the desktop app sets [`PdfCraftApp::printer_source`]):
-/// on Windows each driver's capabilities are read for its two-sided support, and CUPS' driverless discovery can wait on
-/// the network. Without a source the dialog reads them as it opens, so tests stay deterministic.
+/// Lists the printers off the UI thread (the desktop app sets [`PdfCraftApp::printer_source`]),
+/// because CUPS' driverless discovery can wait on the network. Without a source the dialog reads
+/// them as it opens, so tests stay deterministic.
 pub type PrinterSource = std::sync::Arc<dyn Fn() -> Vec<spool::Printer> + Send + Sync>;
 
 /// Where a printer's driver options come from: the spooler's (`spool::printer_options_in`, in the
@@ -36,8 +36,15 @@ pub type PrinterSource = std::sync::Arc<dyn Fn() -> Vec<spool::Printer> + Send +
 pub type OptionsSource = std::sync::Arc<dyn Fn(&str) -> Vec<spool::PrinterOption> + Send + Sync>;
 
 /// The system spooler's printers, as the desktop app's [`PrinterSource`].
+///
+/// The queues, not [`spool::printers`]: on Windows that reads every driver's PrintCapabilities,
+/// which waits on the device, so one networked printer asleep or off the network leaves the whole
+/// list unread. A laptop away from its office does that every time, and the dialog then sits on
+/// "Looking for printers…" with nothing to choose but Save as PDF, because the background read
+/// never returns to clear it. The dialog only needs names here; submission still checks the job's
+/// options against the driver.
 pub fn system_printers() -> PrinterSource {
-    std::sync::Arc::new(spool::printers)
+    std::sync::Arc::new(spool::printer_queues)
 }
 
 /// The Print dialog's work in the background: the printer list being read, and the jobs being
@@ -75,7 +82,9 @@ fn listed_printers() -> Vec<spool::Printer> {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        spool::printers()
+        // The queues, for the reason in [`system_printers`]: this path runs on the UI thread, so
+        // waiting on a sleeping printer would freeze the window rather than just the list.
+        spool::printer_queues()
     }
 }
 
