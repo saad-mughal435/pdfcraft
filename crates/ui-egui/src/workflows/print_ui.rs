@@ -785,4 +785,36 @@ mod tests {
         let rasters = preview_rasters(&later, &sizes, &labels, 2.0, 8192.0);
         assert!(rasters.iter().any(|(page, _)| *page == 2));
     }
+
+    /// #3377: Ctrl+P then Enter prints, which is how Acrobat behaves and how a print room works.
+    /// The dialog opens with the printer dropdown focused, so Return used to open that dropdown
+    /// instead of printing. Return acts only when the Print button itself would.
+    #[test]
+    fn return_prints_once_the_dialog_is_ready() {
+        use egui_kittest::Harness;
+
+        let enter_prints = |sizes: Vec<(f64, f64)>| -> bool {
+            let went = std::rc::Rc::new(std::cell::Cell::new(false));
+            let seen = went.clone();
+            let mut draft = PrintDraft::default();
+            let mut h = Harness::builder().with_size(egui::vec2(900.0, 760.0)).build_ui(move |ui| {
+                // The dialog's own labels, so the harness needs the interface faces to lay them out.
+                crate::theme::install_fonts(ui.ctx());
+                let t = Tokens::get(ui.ctx());
+                let (go, _cancel) = body(ui, &mut draft, &t, &sizes, &[], &mut |_| None);
+                if go {
+                    seen.set(true);
+                }
+            });
+            h.run_steps(3);
+            assert!(!went.get(), "nothing is printed before a key is pressed");
+            h.event(egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
+            h.run_steps(3);
+            went.get()
+        };
+
+        assert!(enter_prints(vec![(200.0, 300.0)]), "Return prints a dialog that is ready to print");
+        // Nothing to lay out means the Print button is disabled, and Return must not act either.
+        assert!(!enter_prints(Vec::new()), "Return does nothing when the button itself would not");
+    }
 }

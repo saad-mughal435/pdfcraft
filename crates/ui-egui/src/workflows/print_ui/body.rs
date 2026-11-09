@@ -562,12 +562,38 @@ pub(crate) fn body(
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         let looking = still_looking(d);
         let label = if d.printer.is_some() || looking { tl!("Print") } else { tl!("Save as PDF") };
-        if ui.add_enabled_ui(settings.is_ok() && !sheets.is_empty() && !looking, |ui| widgets::pill_button(ui, label, true)).inner.clicked() {
+        let ready = settings.is_ok() && !sheets.is_empty() && !looking;
+        if ui.add_enabled_ui(ready, |ui| widgets::pill_button(ui, label, true)).inner.clicked() {
             go = true;
         }
         if widgets::pill_button(ui, tl!("Cancel"), false).clicked() {
             cancel = true;
         }
+        if ready && default_action_pressed(ui) {
+            go = true;
+        }
     });
     (go, cancel)
+}
+
+/// Whether Return should act as the dialog's default button this frame (#3377).
+///
+/// Ctrl+P then Enter is how a print room works, and how Acrobat behaves: the settings are already
+/// chosen, so the keyboard should never have to leave Enter. Before this, Return did nothing
+/// useful here, and because the dialog opens with the printer dropdown focused it would open that
+/// dropdown instead of printing.
+///
+/// Return is left alone whenever something else has a better claim on it:
+///
+/// - a text field is being typed into (a page range, a copy count), where Return belongs to the
+///   field, so `egui_wants_keyboard_input` is the same test the rest of the app uses for this;
+/// - a dropdown list is open, where Return picks the highlighted option. This is the case that
+///   makes the focused-but-closed dropdown safe to print through: the button holding focus is not
+///   the list being open.
+fn default_action_pressed(ui: &egui::Ui) -> bool {
+    let ctx = ui.ctx();
+    if ctx.egui_wants_keyboard_input() || ctx.any_popup_open() {
+        return false;
+    }
+    ctx.input(|i| i.key_pressed(egui::Key::Enter))
 }
